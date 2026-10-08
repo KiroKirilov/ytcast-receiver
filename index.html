@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+  YT Cast custom Web Receiver: Google's standard Cast player (same as the Default Media Receiver),
+  but configured to buffer much further ahead so short Wi-Fi hiccups don't cause "Loading…".
+  Host this file over HTTPS (e.g. GitHub Pages) and register its URL in the Cast Developer Console.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>YT Cast</title>
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <style>
+    body { margin: 0; background: #000; }
+    cast-media-player { --theme-hue: 0; --progress-color: #e53935; }
+  </style>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+  <script>
+    const context = cast.framework.CastReceiverContext.getInstance();
+
+    const playbackConfig = new cast.framework.PlaybackConfig();
+    // Shaka (used for the DASH streams YT Cast sends) keeps this much video buffered ahead.
+    // The Default Media Receiver keeps far less, so a few seconds of slow Wi-Fi empties it.
+    // 90 s of 1080p60 is ~70 MB — comfortably within a Chromecast's memory.
+    playbackConfig.shakaConfig = {
+      streaming: {
+        bufferingGoal: 90,     // seconds buffered ahead
+        rebufferingGoal: 3,    // seconds needed before (re)starting playback
+        bufferBehind: 15,      // seconds kept behind the playhead (cheap quick rewinds)
+      },
+    };
+    playbackConfig.autoResumeDuration = 3;
+
+    const options = new cast.framework.CastReceiverOptions();
+    options.playbackConfig = playbackConfig;
+    context.start(options);
+  </script>
+</body>
+</html>
