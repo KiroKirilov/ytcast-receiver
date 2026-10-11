@@ -1,7 +1,10 @@
 <!doctype html>
 <!--
-  YT Cast custom Web Receiver: Google's standard Cast player (same as the Default Media Receiver),
-  but configured to buffer much further ahead so short Wi-Fi hiccups don't cause "Loading…".
+  YT Cast custom Web Receiver: Google's standard Cast player, plus
+  - a much bigger, earlier-fetched buffer, so short Wi-Fi/phone hiccups don't cause "Loading…";
+  - a private channel to the YT Cast app (urn:x-cast:dev.ytcast.sync) that reports the exact
+    playback position several times a second (for phone-audio sync) and TV-side diagnostics
+    (buffer level, bandwidth, dropped frames, errors) for the app's log.
   Host this file over HTTPS (e.g. GitHub Pages) and register its URL in the Cast Developer Console.
 -->
 <html>
@@ -17,23 +20,140 @@
 <body>
   <cast-media-player></cast-media-player>
   <script>
+    const NS = 'urn:x-cast:dev.ytcast.sync';
     const context = cast.framework.CastReceiverContext.getInstance();
+    const player = context.getPlayerManager();
+    const Ev = cast.framework.events.EventType;
 
+    // ---- Buffering: buffer far ahead, fetch upcoming segments early, recover fast -------------
     const playbackConfig = new cast.framework.PlaybackConfig();
-    // Shaka (used for the DASH streams YT Cast sends) keeps this much video buffered ahead.
-    // The Default Media Receiver keeps far less, so a few seconds of slow Wi-Fi empties it.
-    // 90 s of 1080p60 is ~70 MB — comfortably within a Chromecast's memory.
     playbackConfig.shakaConfig = {
       streaming: {
-        bufferingGoal: 90,     // seconds buffered ahead
-        rebufferingGoal: 3,    // seconds needed before (re)starting playback
-        bufferBehind: 15,      // seconds kept behind the playhead (cheap quick rewinds)
+        bufferingGoal: 90,       // keep 90 s buffered ahead (default is far less)
+        rebufferingGoal: 2,      // seconds needed before (re)starting playback
+        bufferBehind: 15,        // seconds kept behind the playhead
+        segmentPrefetchLimit: 3, // fetch the next segments in parallel, ahead of need
+        retryParameters: {
+          maxAttempts: 8,        // a failed request is retried quickly instead of stalling
+          baseDelay: 250,
+          backoffFactor: 1.5,
+          fuzzFactor: 0.3,
+          timeout: 20000,
+          stallTimeout: 5000,    // no data for 5 s → abort and retry the request
+          connectionTimeout: 5000,
+        },
+        stallEnabled: true,      // nudge past tiny decoder stalls instead of freezing
+        stallThreshold: 1,
+        stallSkip: 0.1,
       },
     };
-    playbackConfig.autoResumeDuration = 3;
+    playbackConfig.autoResumeDuration = 2;
+
+    // ---- Sync channel -------------------------------------------------------------------------
+    function send(obj, senderId) {
+      try { context.sendCustomMessage(NS, senderId, obj); } catch (e) { /* no sender connected */ }
+    }
+
+    // The video element lives inside <cast-media-player>; used for exact buffer levels and
+    // dropped-frame counts. Diagnostics degrade gracefully if it can't be found.
+    function mediaElement() {
+      return document.querySelector('video') ||
+        document.querySelector('cast-media-player')?.shadowRoot?.querySelector('video') || null;
+    }
+
+    function bufferedAheadSec() {
+      const v = mediaElement();
+      if (!v) return null;
+      const t = v.currentTime;
+      for (let i = 0; i < v.buffered.length; i++) {
+        if (v.buffered.start(i) <= t + 0.3 && t <= v.buffered.end(i)) return v.buffered.end(i) - t;
+      }
+      return 0;
+    }
+
+    let buffering = false;
+    let bufferingSince = 0;
+
+    function clock() {
+      return {
+        type: 'clock',
+        rt: performance.now(),             // receiver's monotonic clock, ms
+        pos: player.getCurrentTimeSec(),   // media position, s
+        rate: (player.getPlaybackRate && player.getPlaybackRate()) || 1,
+        state: player.getPlayerState(),    // PLAYING / PAUSED / BUFFERING / IDLE
+        buffering: buffering,
+      };
+    }
+
+    function diag() {
+      const s = (player.getStats && player.getStats()) || {};
+      const v = mediaElement();
+      const q = v && v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+      const ahead = bufferedAheadSec();
+      return {
+        type: 'diag',
+        state: player.getPlayerState(),
+        bufAhead: ahead == null ? null : Math.round(ahead * 10) / 10,
+        bw: s.estimatedBandwidth || null,         // bits/s, the player's own measurement
+        streamBw: s.streamBandwidth || null,      // bits/s needed by the current stream
+        dropped: q ? q.droppedVideoFrames : (s.droppedFrames ?? null),
+        decoded: q ? q.totalVideoFrames : (s.decodedFrames ?? null),
+        width: s.width || null,
+        height: s.height || null,
+        bufferingTime: s.bufferingTime ?? null,
+        stalls: s.stallsDetected ?? null,
+        gaps: s.gapsJumped ?? null,
+      };
+    }
+
+    function mediaLoaded() {
+      const st = player.getPlayerState();
+      return st === 'PLAYING' || st === 'PAUSED' || st === 'BUFFERING';
+    }
+
+    // Position reports: 4× a second while media is loaded, and immediately on any change.
+    setInterval(() => { if (mediaLoaded()) send(clock()); }, 250);
+    // Diagnostics snapshot every 5 s.
+    setInterval(() => { if (mediaLoaded()) send(diag()); }, 5000);
+
+    [Ev.PLAYING, Ev.PAUSE, Ev.SEEKING, Ev.SEEKED, Ev.WAITING, Ev.RATE_CHANGE]
+      .filter(Boolean)
+      .forEach(t => player.addEventListener(t, () => send(clock())));
+
+    player.addEventListener(Ev.BUFFERING, e => {
+      const now = performance.now();
+      if (e.isBuffering && !buffering) {
+        buffering = true;
+        bufferingSince = now;
+        send(clock());
+        send(Object.assign(diag(), { type: 'event', what: 'buffering' }));
+      } else if (!e.isBuffering && buffering) {
+        buffering = false;
+        send(clock());
+        send(Object.assign(diag(), { type: 'event', what: 'resumed', ms: Math.round(now - bufferingSince) }));
+      }
+    });
+
+    player.addEventListener(Ev.ERROR, e => {
+      send({
+        type: 'event', what: 'error',
+        code: e.detailedErrorCode ?? null,
+        reason: e.reason ?? null,
+        detail: e.error && (e.error.message || e.error.code) ? String(e.error.message || e.error.code) : null,
+      });
+    });
+
+    // Ping/pong lets the phone measure the clock offset between the two devices.
+    context.addCustomMessageListener(NS, ev => {
+      const m = ev.data || {};
+      if (m.type === 'ping') send({ type: 'pong', t1: m.t1, rt: performance.now() }, ev.senderId);
+      else if (m.type === 'hello') { send(clock(), ev.senderId); send(diag(), ev.senderId); }
+    });
 
     const options = new cast.framework.CastReceiverOptions();
     options.playbackConfig = playbackConfig;
+    options.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
+    options.versionCode = 2;
     context.start(options);
   </script>
 </body>
