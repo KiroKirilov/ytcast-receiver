@@ -4,7 +4,9 @@
   - a much bigger, earlier-fetched buffer, so short Wi-Fi/phone hiccups don't cause "Loading…";
   - a private channel to the YT Cast app (urn:x-cast:dev.ytcast.sync) that reports the exact
     playback position several times a second (for phone-audio sync) and TV-side diagnostics
-    (buffer level, bandwidth, dropped frames, errors) for the app's log.
+    (buffer level, bandwidth, dropped frames, errors) for the app's log;
+  - a SponsorBlock ribbon: the app sends the video's segments, and while one plays a small label
+    with its type ("Sponsor", "Intro", …) shows bottom right. Skipping is done from the phone.
   Host this file over HTTPS (e.g. GitHub Pages) and register its URL in the Cast Developer Console.
 -->
 <html>
@@ -15,10 +17,24 @@
   <style>
     body { margin: 0; background: #000; }
     cast-media-player { --theme-hue: 0; --progress-color: #e53935; }
+    /* SponsorBlock ribbon, bottom right above the player's progress bar (TV-safe margins) */
+    #sb {
+      position: fixed; right: 5vw; bottom: 14vh; z-index: 1000;
+      display: flex; align-items: center; gap: 1.2vh;
+      padding: 1.1vh 1.9vh 1.1vh 1.4vh; border-radius: 0.9vh;
+      background: rgba(0, 0, 0, 0.72); color: #fff;
+      font: 500 2.6vh/1 Roboto, 'Google Sans', Arial, sans-serif; letter-spacing: 0.02em;
+      opacity: 0; transform: translateX(2vh); transition: opacity 0.25s, transform 0.25s;
+      pointer-events: none;
+    }
+    #sb.on { opacity: 1; transform: none; }
+    #sb .stripe { width: 0.6vh; height: 2.8vh; border-radius: 0.3vh; background: var(--c, #00d400); }
+    #sb .left { opacity: 0.65; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
+  <div id="sb"><span class="stripe"></span><span id="sbLabel"></span><span class="left" id="sbLeft"></span></div>
   <script>
     const NS = 'urn:x-cast:dev.ytcast.sync';
     const context = cast.framework.CastReceiverContext.getInstance();
@@ -143,17 +159,61 @@
       });
     });
 
+    // ---- SponsorBlock ribbon ---------------------------------------------------------------------
+    // The app sends {type:'segments', contentId, segments:[{start, end, label, color}]} (seconds)
+    // after each load. The ribbon follows the TV's own playhead, so it's exact.
+    let segs = [];
+    let segsFor = null;
+    let shownSeg = null;
+    const sbEl = document.getElementById('sb');
+    const sbLabel = document.getElementById('sbLabel');
+    const sbLeft = document.getElementById('sbLeft');
+
+    function contentIdNow() {
+      const m = player.getMediaInformation && player.getMediaInformation();
+      return m ? (m.contentId || m.contentUrl || null) : null;
+    }
+
+    function fmt(sec) {
+      const s = Math.max(0, Math.ceil(sec));
+      return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    }
+
+    function updateRibbon() {
+      let seg = null;
+      const now = contentIdNow();
+      if (segs.length && mediaLoaded() && !(segsFor && now && segsFor !== now)) {
+        const t = player.getCurrentTimeSec();
+        // Same rules as the phone's skip button: ≥ 1 s long, gone 0.5 s before the end.
+        seg = segs.find(s => s.end - s.start >= 1 && t >= s.start && t < s.end - 0.5) || null;
+        if (seg) sbLeft.textContent = fmt(seg.end - t);
+      }
+      if (seg === shownSeg) return;
+      shownSeg = seg;
+      if (seg) {
+        sbLabel.textContent = seg.label;
+        sbEl.style.setProperty('--c', seg.color || '#00d400');
+      }
+      sbEl.classList.toggle('on', !!seg);
+    }
+    setInterval(updateRibbon, 250);
+
     // Ping/pong lets the phone measure the clock offset between the two devices.
     context.addCustomMessageListener(NS, ev => {
       const m = ev.data || {};
       if (m.type === 'ping') send({ type: 'pong', t1: m.t1, rt: performance.now() }, ev.senderId);
       else if (m.type === 'hello') { send(clock(), ev.senderId); send(diag(), ev.senderId); }
+      else if (m.type === 'segments') {
+        segs = (m.segments || []).slice().sort((a, b) => a.start - b.start);
+        segsFor = m.contentId || null;
+        updateRibbon();
+      }
     });
 
     const options = new cast.framework.CastReceiverOptions();
     options.playbackConfig = playbackConfig;
     options.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
-    options.versionCode = 2;
+    options.versionCode = 3;
     context.start(options);
   </script>
 </body>
